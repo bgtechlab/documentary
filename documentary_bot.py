@@ -18,7 +18,7 @@ import requests
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 PEXELS_KEY = os.getenv("PEXELS_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.6-flash"  # pehle yahi, fail ho to auto-detect
 TOPIC = (os.getenv("TOPIC") or "auto").strip()
 MINUTES = max(5, min(10, int(os.getenv("MINUTES") or 7)))
 PRIVACY = os.getenv("PRIVACY", "private")
@@ -43,24 +43,65 @@ def run(cmd, **kw):
 
 
 # ------------------------------------------------------------------ Gemini
-def gemini_json(prompt, retries=3):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+_MODELS = None
+_BAD = ("lite", "image", "tts", "live", "audio", "embedding", "robotics", "computer", "thinking", "exp", "vision")
+
+
+def candidate_models():
+    """Account me jo Gemini flash models available hain unki list (naye pehle)."""
+    global _MODELS
+    if _MODELS is not None:
+        return _MODELS
+    names = []
+    if GEMINI_MODEL:
+        names.append(GEMINI_MODEL)
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"key": GEMINI_KEY, "pageSize": 200}, timeout=30)
+        r.raise_for_status()
+        stable, preview = [], []
+        for m in r.json().get("models", []):
+            n = m["name"].split("/")[-1]
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            if "flash" not in n or any(b in n for b in _BAD):
+                continue
+            (preview if "preview" in n else stable).append(n)
+        names += sorted(stable, reverse=True) + sorted(preview, reverse=True)
+    except Exception as e:
+        log("Model list fetch failed:", e)
+    names += ["gemini-flash-latest", "gemini-2.5-flash"]
+    _MODELS = list(dict.fromkeys(names))
+    log("Gemini models to try:", _MODELS[:6])
+    return _MODELS
+
+
+def gemini_json(prompt, retries=2):
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.8},
     }
     last = None
-    for i in range(retries):
-        try:
-            r = requests.post(url, json=body, timeout=180)
-            r.raise_for_status()
-            txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
-            return json.loads(txt)
-        except Exception as e:
-            last = e
-            log("Gemini retry", i + 1, e)
-            time.sleep(5 * (i + 1))
+    for model in candidate_models():
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        for i in range(retries):
+            try:
+                r = requests.post(url, json=body, timeout=180)
+                if r.status_code in (400, 404):
+                    last = f"{model}: HTTP {r.status_code} {r.text[:200]}"
+                    log("model skip:", last)
+                    break  # agla model try karo
+                r.raise_for_status()
+                txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
+                data = json.loads(txt)
+                global _MODELS
+                _MODELS = [model]  # chalne wala model yaad rakho
+                return data
+            except Exception as e:
+                last = f"{model}: {e}"
+                log("Gemini retry", i + 1, last)
+                time.sleep(5 * (i + 1))
     raise RuntimeError(f"Gemini failed: {last}")
 
 
