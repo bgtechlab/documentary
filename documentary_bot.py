@@ -8,16 +8,18 @@ Pipeline:
   -> Pillow thumbnail -> YouTube upload (default: private)
 
 ENV (GitHub Secrets):
-  GEMINI_API_KEY, PEXELS_API_KEY
+  GEMINI_API_KEY
   YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN   (optional - upload skip ho jayega agar nahi hain)
 ENV (workflow inputs):
   TOPIC ("auto" = Gemini khud topic chunega), MINUTES (5-10), PRIVACY (private/unlisted/public)
 """
 import os, sys, json, re, math, glob, random, subprocess, time, shutil
 import requests
+from ddgs import DDGS
+from PIL import Image
+from io import BytesIO
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-PEXELS_KEY = os.getenv("PEXELS_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.6-flash"  # pehle yahi, fail ho to auto-detect
 TOPIC = (os.getenv("TOPIC") or "auto").strip()
 MINUTES = max(5, min(10, int(os.getenv("MINUTES") or 7)))
@@ -129,7 +131,7 @@ Rules:
 - Narration language: Hindi in Devanagari script ONLY. Simple spoken Hindi, short sentences, no English words unless it is a proper noun. No emojis, no markdown, no stage directions.
 - Only well-known, verifiable facts. If unsure about a number or date, avoid it.
 - Exactly {n_scenes} scenes, each narration about {per_scene} words.
-- For every scene give 3 'keywords': English stock-photo search phrases (2-4 words, concrete and visual, e.g. "ancient temple india", "rocket launch night"). Do not use people's names.
+- For every scene provide ONE precise English image_query (5-12 words) describing the exact visual needed for that narration. Prefer historically accurate objects, locations, events, archival photographs or paintings.
 
 Return ONLY JSON:
 {{
@@ -137,7 +139,7 @@ Return ONLY JSON:
   "thumb_text": "3-5 powerful Hindi words for thumbnail",
   "description": "Hindi description 3-4 lines",
   "tags": ["tag1", "tag2", "... 10 tags, mix Hindi and English"],
-  "scenes": [ {{"narration": "...", "keywords": ["...", "...", "..."]}} ]
+  "scenes": [ {{"narration": "...", "image_query": "specific visual search phrase in English"}} ]
 }}"""
     data = gemini_json(p)
     scenes = [s for s in data.get("scenes", []) if s.get("narration")]
@@ -171,56 +173,86 @@ def make_voice(text, idx):
 
 
 # ------------------------------------------------------------------ Images
-USED = set()
+USED_IMAGE_URLS = set()
+IMG_HEADERS = {"User-Agent": "BGDocumentaryBot/1.0 (educational video)"}
 
 
-def pexels_images(keywords, need, tag):
-    """need images download karta hai, files ki list return karta hai."""
-    paths = []
-    if not PEXELS_KEY:
-        return paths
-    for kw in keywords:
-        if len(paths) >= need:
-            break
+def _save_valid_image(content, path):
+    try:
+        img = Image.open(BytesIO(content))
+        img.verify()
+        img = Image.open(BytesIO(content)).convert("RGB")
+        if img.width < 600 or img.height < 400:
+            return False
+        img.save(path, "JPEG", quality=92, optimize=True)
+        return True
+    except Exception as e:
+        log("Image validation failed:", e)
+        return False
+
+
+def _wikimedia_image(query, path):
+    api = "https://commons.wikimedia.org/w/api.php"
+    for term in (f"filetype:bitmap {query}", f"{query} historical photograph"):
         try:
-            r = requests.get(
-                "https://api.pexels.com/v1/search",
-                params={"query": kw, "per_page": 15, "orientation": "landscape"},
-                headers={"Authorization": PEXELS_KEY}, timeout=30)
+            params = {"action":"query","format":"json","generator":"search","gsrsearch":term,
+                      "gsrnamespace":6,"gsrlimit":10,"prop":"imageinfo",
+                      "iiprop":"url|size|mime","iiurlwidth":1600}
+            r = requests.get(api, params=params, headers=IMG_HEADERS, timeout=25)
             r.raise_for_status()
-            photos = r.json().get("photos", [])
-            random.shuffle(photos)
-            for ph in photos:
-                if ph["id"] in USED:
+            pages = r.json().get("query",{}).get("pages",{})
+            candidates=[]
+            for page in pages.values():
+                infos=page.get("imageinfo") or []
+                if infos:
+                    info=infos[0]; url=info.get("thumburl") or info.get("url")
+                    if url and (info.get("size") or 0)>=20000:
+                        candidates.append((info.get("size") or 0,url))
+            for _,url in sorted(candidates,reverse=True):
+                try:
+                    res=requests.get(url,headers=IMG_HEADERS,timeout=25)
+                    if res.status_code==200 and len(res.content)>15000 and _save_valid_image(res.content,path):
+                        USED_IMAGE_URLS.add(url); log("Wikimedia image:",query); return True
+                except Exception:
                     continue
-                url = ph["src"].get("large2x") or ph["src"]["large"]
-                img = requests.get(url, timeout=60)
-                if img.status_code != 200:
+        except Exception as ex:
+            log("Wikimedia search failed:",ex)
+    return False
+
+
+def _ddgs_image(query, path):
+    for backend in ("bing","duckduckgo",None):
+        try:
+            with DDGS() as ddgs:
+                opts={"max_results":15}
+                if backend: opts["backend"]=backend
+                results=list(ddgs.images(query,**opts))
+            for item in results:
+                url=item.get("image") or item.get("url")
+                if not url or url in USED_IMAGE_URLS: continue
+                try:
+                    res=requests.get(url,headers=IMG_HEADERS,timeout=25,allow_redirects=True)
+                    if res.status_code==200 and len(res.content)>18000 and _save_valid_image(res.content,path):
+                        USED_IMAGE_URLS.add(url); log("DDGS image:",query); return True
+                except Exception:
                     continue
-                p = f"{WORK}/img_{tag}_{len(paths)}.jpg"
-                with open(p, "wb") as f:
-                    f.write(img.content)
-                USED.add(ph["id"])
-                paths.append(p)
-                if len(paths) >= need:
-                    break
-        except Exception as e:
-            log("pexels error", kw, e)
+        except Exception as ex:
+            log("DDGS backend failed:",backend,ex)
+    return False
+
+
+def scene_images(scene, need, tag):
+    query=(scene.get("image_query") or "").strip()
+    if not query: query=" ".join(scene.get("keywords",[]))
+    if not query: query="historical documentary archive photograph"
+    paths=[]
+    for term in (query, f"{query} historical photograph", f"{query} archive image"):
+        if len(paths)>=need: break
+        path=f"{WORK}/img_{tag}_{len(paths)}.jpg"
+        if _wikimedia_image(term,path) or _ddgs_image(term,path):
+            paths.append(path)
+        time.sleep(0.4)
     return paths
-
-
-def fallback_image(tag, n):
-    from PIL import Image, ImageDraw
-    p = f"{WORK}/img_{tag}_fb{n}.jpg"
-    img = Image.new("RGB", (1920, 1080))
-    d = ImageDraw.Draw(img)
-    c1 = (random.randint(10, 60), random.randint(10, 60), random.randint(40, 120))
-    c2 = (random.randint(0, 30), random.randint(0, 30), random.randint(0, 50))
-    for y in range(1080):
-        t = y / 1080
-        d.line([(0, y), (1920, y)], fill=tuple(int(c1[i] * (1 - t) + c2[i] * t) for i in range(3)))
-    img.save(p, quality=90)
-    return p
 
 
 # ------------------------------------------------------------------ Video
@@ -242,7 +274,7 @@ def ken_burns_clip(img, dur, out, zoom_in=True):
 def build_scene(idx, scene, mp3, dur):
     total = dur + 0.4
     n = max(1, math.ceil(total / IMG_SECONDS))
-    imgs = pexels_images(scene.get("keywords", []), n, f"{idx:02d}")
+    imgs = scene_images(scene, n, f"{idx:02d}")
     while len(imgs) < n:
         imgs.append(imgs[-1] if imgs else fallback_image(f"{idx:02d}", len(imgs)))
     seg = total / n
@@ -414,8 +446,7 @@ def upload_youtube(video, thumb, meta):
 def main():
     if not GEMINI_KEY:
         sys.exit("GEMINI_API_KEY missing")
-    if not PEXELS_KEY:
-        log("WARNING: PEXELS_API_KEY nahi hai - sirf plain background use honge.")
+    log("Image search: Wikimedia Commons first, DDGS/Bing fallback; no API key required.")
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(WORK)
     os.makedirs(OUT, exist_ok=True)
@@ -450,7 +481,7 @@ def main():
         make_thumbnail(data.get("thumb_text") or data["title"], bg, thumb)
 
     data["description"] = (data["description"] +
-                           "\n\nFootage: Pexels (free license). Voice: AI generated.\n"
+                           "\n\nVisual sources: Wikimedia Commons and web image search. Licenses/attribution vary by source; verify reuse rights. Voice: AI generated.\n"
                            "इस वीडियो में AI वॉइस और स्टॉक फुटेज का उपयोग हुआ है।")
     upload_youtube(video, thumb, data)
     log("DONE")
