@@ -5,7 +5,7 @@ documentary_bot.py - Hindi Documentary Video Bot (5-10 min, faceless)
 Pipeline:
   Topic -> Gemini script (scenes) -> edge-tts Hindi female voice
   -> Pexels images -> ffmpeg (Ken Burns + subtitles + music)
-  -> Pillow thumbnail -> YouTube upload (default: private)
+  -> Pillow thumbnail (thumbnails.py, 4 styles) -> YouTube upload (default: private)
 
 ENV (GitHub Secrets):
   GEMINI_API_KEY
@@ -18,6 +18,7 @@ import requests
 from ddgs import DDGS
 from PIL import Image
 from io import BytesIO
+from thumbnails import make_thumbnail
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.6-flash"  # pehle yahi, fail ho to auto-detect
@@ -136,7 +137,13 @@ Rules:
 Return ONLY JSON:
 {{
   "title": "catchy Hindi title (Devanagari), max 90 characters",
-  "thumb_text": "3-5 powerful Hindi words for thumbnail",
+  "thumb": {{
+    "line1": "Hindi hook, 2-3 words",
+    "line2": "Hindi main phrase, 2-3 words, akele padhne par bhi poora matlab de",
+    "line3": "Hindi punch phrase, 1-2 words",
+    "kicker": "Hindi small heading, 2-4 words",
+    "keywords": ["3 single Hindi words"]
+  }},
   "description": "Hindi description 3-4 lines",
   "tags": ["tag1", "tag2", "... 10 tags, mix Hindi and English"],
   "scenes": [ {{"narration": "...", "image_query": "specific visual search phrase in English"}} ]
@@ -348,58 +355,6 @@ def final_render(scene_files, srt_path, out_path):
     run(cmd, cwd=WORK)  # cwd=WORK taaki subtitles path simple rahe
 
 
-# ------------------------------------------------------------------ Thumbnail
-def find_font():
-    for pat in ["/usr/share/fonts/**/NotoSansDevanagari-Bold.ttf",
-                "/usr/share/fonts/**/NotoSansDevanagari*Bold*.ttf",
-                "/usr/share/fonts/**/NotoSansDevanagari*.ttf"]:
-        f = glob.glob(pat, recursive=True)
-        if f:
-            return f[0]
-    return None
-
-
-def make_thumbnail(text, bg_img, out_path):
-    from PIL import Image, ImageDraw, ImageFont, ImageEnhance
-    img = Image.open(bg_img).convert("RGB")
-    img = img.resize((1280, 720)) if img.size != (1280, 720) else img
-    img = ImageEnhance.Brightness(img).enhance(0.55)
-    img = ImageEnhance.Contrast(img).enhance(1.2)
-    d = ImageDraw.Draw(img)
-    font_path = find_font()
-    size = 120
-    font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
-
-    def wrap(t, fnt, maxw):
-        lines, cur = [], ""
-        for w in t.split():
-            test = (cur + " " + w).strip()
-            if d.textlength(test, font=fnt) <= maxw:
-                cur = test
-            else:
-                if cur:
-                    lines.append(cur)
-                cur = w
-        if cur:
-            lines.append(cur)
-        return lines
-
-    lines = wrap(text, font, 1120)
-    while len(lines) > 3 and size > 70 and font_path:
-        size -= 10
-        font = ImageFont.truetype(font_path, size)
-        lines = wrap(text, font, 1120)
-    lh = size * 1.35
-    y = (720 - lh * len(lines)) / 2
-    for ln in lines:
-        w = d.textlength(ln, font=font)
-        x = (1280 - w) / 2
-        d.text((x, y), ln, font=font, fill=(255, 215, 0),
-               stroke_width=8, stroke_fill=(0, 0, 0))
-        y += lh
-    img.save(out_path, quality=92)
-
-
 # ------------------------------------------------------------------ YouTube
 def upload_youtube(video, thumb, meta):
     cid, sec, rt = os.getenv("YT_CLIENT_ID"), os.getenv("YT_CLIENT_SECRET"), os.getenv("YT_REFRESH_TOKEN")
@@ -478,7 +433,8 @@ def main():
     bg = next(iter(sorted(glob.glob(f"{WORK}/img_*.jpg"))), None)
     thumb = f"{OUT}/thumbnail.jpg"
     if bg:
-        make_thumbnail(data.get("thumb_text") or data["title"], bg, thumb)
+        style = make_thumbnail(data, bg, thumb, int(os.getenv("GITHUB_RUN_NUMBER") or random.randrange(4)))
+        log("Thumbnail style:", style)
 
     data["description"] = (data["description"] +
                            "\n\nVisual sources: Wikimedia Commons and web image search. Licenses/attribution vary by source; verify reuse rights. Voice: AI generated.\n"
